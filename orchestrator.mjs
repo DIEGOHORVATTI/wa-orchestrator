@@ -75,6 +75,12 @@ const OPENCODE_BIN = process.env.WA_OPENCODE_BIN || "opencode";
 // (n8n, cloudflare docs, whatsapp, etc.) which can take 1-2+ minutes. The
 // warm server keeps that state loaded, cutting typical replies to ~10s.
 const OPENCODE_SERVER_URL = process.env.WA_OPENCODE_SERVER_URL || "http://127.0.0.1:4096";
+// Shell used to run raw commands (see SHELL_COMMANDS below). Must be an
+// interactive-capable login shell so aliases like `gco` (oh-my-zsh's
+// `git checkout`) resolve — plain `sh -c` / non-interactive shells don't
+// load rc files and won't know about them.
+const USER_SHELL = process.env.WA_SHELL || "zsh";
+const START_TIME = Date.now();
 
 function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.map(String).join(" ")}\n`;
@@ -158,6 +164,92 @@ function markdownToWhatsApp(text) {
   return out.trim();
 }
 
+// First-word allowlist: messages whose first token matches one of these are
+// treated as literal shell commands (run directly, no LLM involved) instead
+// of an OpenCode prompt. Covers navigation, inspection, and common git/
+// oh-my-zsh git-plugin aliases. Extend via WA_SHELL_COMMANDS (comma
+// separated) if you use others.
+const DEFAULT_SHELL_COMMANDS = [
+  "ls", "pwd", "git", "whoami", "date", "echo", "cat", "head", "tail",
+  "wc", "find", "grep", "du", "df", "top", "ps", "which", "tree",
+  "gco", "gst", "gaa", "ga", "gcm", "gc", "gp", "gl", "glog", "glg",
+  "gd", "gds", "gb", "gba", "gbd", "gcb", "gcp", "gpull", "gpush",
+  "grb", "gm", "gss", "gsta", "gstp",
+];
+const SHELL_COMMANDS = new Set(
+  (process.env.WA_SHELL_COMMANDS
+    ? process.env.WA_SHELL_COMMANDS.split(",").map((s) => s.trim()).filter(Boolean)
+    : DEFAULT_SHELL_COMMANDS
+  ).map((c) => c.toLowerCase()),
+);
+
+const MAX_REPLY_CHARS = 3500; // stay well under WhatsApp's own message cap
+
+function truncate(text) {
+  if (text.length <= MAX_REPLY_CHARS) return text;
+  return `${text.slice(0, MAX_REPLY_CHARS)}\n… (cortado, ${text.length} chars no total)`;
+}
+
+// Resolve a `cd` argument against the tracked current directory. Mirrors
+// plain shell semantics for the cases that matter here: no arg / "~" -> HOME,
+// "~/x" -> HOME/x, relative paths resolved against currentCwd, absolute
+// paths used as-is. "cd -" (previous dir) is intentionally not supported.
+function resolveCdTarget(currentCwd, arg) {
+  if (!arg || arg === "~") return HOME;
+  let target = arg;
+  if (target.startsWith("~/")) target = path.join(HOME, target.slice(2));
+  if (!path.isAbsolute(target)) target = path.resolve(currentCwd, target);
+  return path.normalize(target);
+}
+
+function runShellCommand(command, cwd) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(USER_SHELL, ["-ic", command], {
+      cwd,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let output = "";
+    child.stdout.on("data", (d) => (output += d.toString()));
+    child.stderr.on("data", (d) => (output += d.toString()));
+
+    const timeout = setTimeout(() => {
+      child.kill("SIGTERM");
+      reject(new Error("comando travou por mais de 30s"));
+    }, 30 * 1000);
+
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      resolve({ code, output: output.trim() });
+    });
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+  });
+}
+
+async function checkOpencodeServerHealth() {
+  try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 3000);
+    const res = await fetch(`${OPENCODE_SERVER_URL}/doc`, { signal: controller.signal });
+    clearTimeout(t);
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return `${h}h ${m}m ${sec}s`;
+}
+
 const bridgeToken = readBridgeToken();
 const recentMessageIds = new Set();
 
@@ -188,7 +280,7 @@ async function sendWhatsApp(recipient, message) {
   return body;
 }
 
-function runOpencode({ message, sessionId }) {
+function runOpencode({ message, sessionId, cwd }) {
   return new Promise((resolve, reject) => {
     // --auto is required here: headless mode has no TTY to approve tool
     // permission prompts (bash, file edits, etc). Without it, any tool call
@@ -204,16 +296,16 @@ function runOpencode({ message, sessionId }) {
       "--attach",
       OPENCODE_SERVER_URL,
       "--dir",
-      OPENCODE_CWD,
+      cwd,
     ];
     if (sessionId) {
       args.push("--session", sessionId);
     }
 
-    log("spawning:", OPENCODE_BIN, JSON.stringify(args), "cwd=", OPENCODE_CWD);
+    log("spawning:", OPENCODE_BIN, JSON.stringify(args), "cwd=", cwd);
 
     const child = spawn(OPENCODE_BIN, args, {
-      cwd: OPENCODE_CWD,
+      cwd,
       env: process.env,
       // stdin MUST be closed/ignored: opencode run reads stdin (to support
       // piped input) and hangs forever waiting for EOF if left as an open,
@@ -290,20 +382,82 @@ async function handleIncomingMessage(payload) {
 
   const state = loadState();
   const entry = state[ALLOWED_NUMBER] || {};
+  const cwd = entry.cwd || OPENCODE_CWD;
+  const chatTarget = payload.chatJID || senderNumber;
+  const raw = payload.content.trim();
+  const normalized = raw.toLowerCase();
   log("incoming from", senderNumber, "->", JSON.stringify(payload.content).slice(0, 200));
 
   // Manual session reset. WhatsApp never tells us when you clear/delete a
   // chat locally on your phone (that's a device-local action, not synced to
   // linked devices), so the only reliable way to start fresh is this command.
-  const normalized = payload.content.trim().toLowerCase();
   if (["/novo", "/new", "/reset", "/limpar"].includes(normalized)) {
-    delete state[ALLOWED_NUMBER];
+    // Reset the conversation but keep wherever `cd` last left you.
+    if (entry.cwd) {
+      state[ALLOWED_NUMBER] = { cwd: entry.cwd };
+    } else {
+      delete state[ALLOWED_NUMBER];
+    }
     saveState(state);
     await sendWhatsApp(
-      payload.chatJID || senderNumber,
+      chatTarget,
       "\u{1F195} Sessão anterior descartada. A próxima mensagem começa uma conversa nova.",
     );
     log("session reset by command");
+    return;
+  }
+
+  if (normalized === "/status") {
+    const healthy = await checkOpencodeServerHealth();
+    const lines = [
+      "*Status do orquestrador*",
+      `Uptime: ${formatUptime(Date.now() - START_TIME)}`,
+      `Diretório atual: \`${cwd}\``,
+      `Sessão ativa: ${entry.sessionId ? `\`${entry.sessionId}\`` : "nenhuma (próxima mensagem cria uma nova)"}`,
+      `Servidor opencode (${OPENCODE_SERVER_URL}): ${healthy ? "\u2705 online" : "\u26A0\uFE0F sem resposta"}`,
+    ];
+    await sendWhatsApp(chatTarget, markdownToWhatsApp(lines.join("\n")));
+    log("status requested");
+    return;
+  }
+
+  // First-token dispatch: literal shell commands vs. an OpenCode prompt.
+  const firstWord = raw.split(/\s+/)[0]?.toLowerCase();
+
+  if (firstWord === "cd") {
+    const arg = raw.slice(2).trim();
+    const target = resolveCdTarget(cwd, arg);
+    let ok = false;
+    try {
+      ok = fs.statSync(target).isDirectory();
+    } catch {
+      ok = false;
+    }
+    if (!ok) {
+      await sendWhatsApp(chatTarget, `\u26A0\uFE0F Diretório não existe: \`${target}\``);
+      return;
+    }
+    state[ALLOWED_NUMBER] = { ...entry, cwd: target };
+    saveState(state);
+    await sendWhatsApp(chatTarget, `\uD83D\uDCC2 \`${target}\``);
+    log("cd ->", target);
+    return;
+  }
+
+  if (SHELL_COMMANDS.has(firstWord)) {
+    try {
+      const { code, output } = await runShellCommand(raw, cwd);
+      const body = output || "(sem saída)";
+      const status = code === 0 ? "" : `\n\n_(saiu com código ${code})_`;
+      await sendWhatsApp(
+        chatTarget,
+        markdownToWhatsApp(`\`\`\`\n${truncate(body)}\n\`\`\`${status}`),
+      );
+      log("shell command ran, code=", code);
+    } catch (err) {
+      await sendWhatsApp(chatTarget, `\u26A0\uFE0F ${err.message}`);
+      log("ERROR running shell command:", err.message);
+    }
     return;
   }
 
@@ -311,20 +465,21 @@ async function handleIncomingMessage(payload) {
     const { sessionId, text } = await runOpencode({
       message: payload.content,
       sessionId: entry.sessionId,
+      cwd,
     });
 
-    state[ALLOWED_NUMBER] = { sessionId, updatedAt: new Date().toISOString() };
+    state[ALLOWED_NUMBER] = { ...entry, sessionId, updatedAt: new Date().toISOString() };
     saveState(state);
 
     const footer = sessionId
       ? `\n\n\u{1F9F5} \`\`\`opencode --resume "${sessionId}"\`\`\``
       : "";
-    await sendWhatsApp(payload.chatJID || senderNumber, markdownToWhatsApp(`${text}${footer}`));
+    await sendWhatsApp(chatTarget, markdownToWhatsApp(`${text}${footer}`));
     log("replied, session=", sessionId);
   } catch (err) {
     log("ERROR running opencode:", err.message);
     await sendWhatsApp(
-      payload.chatJID || senderNumber,
+      chatTarget,
       markdownToWhatsApp(`\u26A0\uFE0F Erro processando sua mensagem: ${err.message}`),
     );
   }

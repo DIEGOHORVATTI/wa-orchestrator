@@ -105,11 +105,41 @@ Send these as WhatsApp messages to control the bot itself (case-insensitive):
 
 | Command | Effect |
 | --- | --- |
-| `/novo`, `/new`, `/reset`, `/limpar` | Discard the current session; the next message starts a brand new OpenCode conversation. |
+| `/novo`, `/new`, `/reset`, `/limpar` | Discard the current session; the next message starts a brand new OpenCode conversation. Keeps whatever directory `cd` last left you in. |
+| `/status` | Uptime, current directory, active session id, warm-server health. |
 
 Note: deleting/clearing a chat on your phone does **not** reset anything —
 that's a local, device-only action WhatsApp never syncs to linked devices.
 Use `/novo` explicitly when you want a clean slate.
+
+## Terminal passthrough
+
+Messages whose first word matches a small allowlist (`cd`, `ls`, `pwd`,
+`git`, and common oh-my-zsh git aliases like `gco`, `gst`, `gaa`, ...) are
+run **directly as shell commands**, not sent to the LLM. Output comes back
+verbatim in a WhatsApp code block, no tokens spent.
+
+`cd` is special-cased: since every command runs in its own subprocess, a
+real `cd` wouldn't persist anything. Instead the orchestrator tracks a
+per-conversation "current directory" in `state.json` and resolves `cd`
+targets against it (`~`, `~/x`, `..`, relative and absolute paths all work).
+That same tracked directory is then used as `--dir` for **every** OpenCode
+prompt too — so `cd some-project` followed by a plain-English question
+operates on `some-project`, no need to repeat the path.
+
+```
+cd api-consig
+ls
+explica esse projeto pra mim
+```
+
+Extend the allowlist with `WA_SHELL_COMMANDS` (comma-separated) in `.env` if
+you use other aliases. Anything not on the list — including plain English,
+questions, or multi-word instructions — goes to OpenCode as usual.
+
+Commands run through your login shell (`zsh -ic` by default, see
+`WA_SHELL`) so your actual aliases and rc file are honored, with a 30s
+timeout.
 
 ## Running as a persistent service (systemd --user, Linux)
 
