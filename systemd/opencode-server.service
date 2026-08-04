@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenCode headless server (warm, for WhatsApp orchestrator)
+After=network-online.target
+
+[Service]
+Type=simple
+# Adjust the node/opencode paths below to match your install (nvm, asdf,
+# a system package, etc). `which opencode` / `which node` will tell you.
+Environment=PATH=%h/.nvm/versions/node/v20.0.0/bin:%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+# WorkingDirectory is the default project opencode starts in for this
+# server. wa-orchestrator overrides it per-message via --dir anyway.
+WorkingDirectory=%h
+ExecStart=%h/.nvm/versions/node/v20.0.0/bin/opencode serve --port 4096 --hostname 127.0.0.1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

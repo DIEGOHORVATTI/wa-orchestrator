@@ -1,0 +1,15 @@
+[Unit]
+Description=WhatsApp MCP Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=WEBHOOK_URL=http://127.0.0.1:8090/webhook
+WorkingDirectory=%h/whatsapp-mcp/whatsapp-bridge
+ExecStart=%h/whatsapp-mcp/whatsapp-bridge/whatsapp-bridge-bin
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

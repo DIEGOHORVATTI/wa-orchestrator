@@ -1,0 +1,18 @@
+[Unit]
+Description=WhatsApp <-> OpenCode Orchestrator
+After=network-online.target whatsapp-bridge.service opencode-server.service
+Wants=network-online.target
+Requires=whatsapp-bridge.service opencode-server.service
+
+[Service]
+Type=simple
+# Adjust the node path below to match your install (nvm, asdf, a system
+# package, etc). `which node` will tell you.
+Environment=PATH=%h/.nvm/versions/node/v20.0.0/bin:%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h/whatsapp-mcp/wa-orchestrator
+ExecStart=%h/.nvm/versions/node/v20.0.0/bin/node %h/whatsapp-mcp/wa-orchestrator/orchestrator.mjs
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
