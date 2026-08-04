@@ -8,7 +8,7 @@ session id in the footer so you can pick the same conversation back up from a te
 with:
 
 ```bash
-opencode --resume "ses_xxxxxxxxxxxxxxxxxxxx"
+opencode -s "ses_xxxxxxxxxxxxxxxxxxxx"
 ```
 
 Only one phone number is ever allowed to talk to it — every other contact is silently

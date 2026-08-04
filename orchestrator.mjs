@@ -4,7 +4,7 @@
 // Receives incoming-message webhooks from the whatsapp-mcp bridge and routes
 // them into `opencode run --session <id>`, replying back over WhatsApp with
 // the answer plus the session id so the user can resume from any machine
-// with: opencode --resume "<session id>"
+// with: opencode -s "<session id>"
 //
 // Only messages from ALLOWED_NUMBER are processed. Everything else is
 // ignored (no replies are ever sent to any other contact).
@@ -503,8 +503,16 @@ async function handleIncomingMessage(payload) {
   }
 
   try {
+    // `--dir` only sets the *initial* working directory — it is not a
+    // sandbox. The model's bash tool can `cd ..` or use absolute paths
+    // freely, so a vague prompt like "esses repos" can easily make it wander
+    // into sibling/parent directories. A short explicit reminder on every
+    // turn keeps it scoped to what you actually `cd`'d into, without
+    // pretending this is real filesystem isolation (it isn't).
+    const scopedMessage = `[contexto: diretório de trabalho atual é ${cwd} — fique restrito a esse diretório e seus subdiretórios, a menos que eu peça algo fora dele explicitamente]\n\n${payload.content}`;
+
     const { sessionId, text } = await runOpencode({
-      message: payload.content,
+      message: scopedMessage,
       sessionId: entry.sessionId,
       cwd,
     });
@@ -513,7 +521,7 @@ async function handleIncomingMessage(payload) {
     saveState(state);
 
     const footer = sessionId
-      ? `\n\n\u{1F9F5} \`\`\`opencode --resume "${sessionId}"\`\`\``
+      ? `\n\n\u{1F9F5} \`\`\`opencode -s "${sessionId}"\`\`\``
       : "";
     await sendWhatsApp(chatTarget, markdownToWhatsApp(`${text}${footer}`));
     log("replied, session=", sessionId);
