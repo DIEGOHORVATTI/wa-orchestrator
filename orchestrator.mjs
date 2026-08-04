@@ -170,9 +170,9 @@ function markdownToWhatsApp(text) {
 // oh-my-zsh git-plugin aliases. Extend via WA_SHELL_COMMANDS (comma
 // separated) if you use others.
 const DEFAULT_SHELL_COMMANDS = [
-  "ls", "pwd", "git", "whoami", "date", "echo", "cat", "head", "tail",
-  "wc", "find", "grep", "du", "df", "top", "ps", "which", "tree",
-  "gco", "gst", "gaa", "ga", "gcm", "gc", "gp", "gl", "glog", "glg",
+  "ls", "ll", "la", "lt", "pwd", "git", "whoami", "date", "echo", "cat",
+  "head", "tail", "wc", "find", "grep", "du", "df", "top", "ps", "which",
+  "tree", "gco", "gst", "gaa", "ga", "gcm", "gc", "gp", "gl", "glog", "glg",
   "gd", "gds", "gb", "gba", "gbd", "gcb", "gcp", "gpull", "gpush",
   "grb", "gm", "gss", "gsta", "gstp",
 ];
@@ -202,11 +202,37 @@ function resolveCdTarget(currentCwd, arg) {
   return path.normalize(target);
 }
 
-function runShellCommand(command, cwd) {
+// `eza` (this box's `ls`/`ll`/`la`/`lt`/`tree` alias target, see .zshrc) has
+// a quirk where invoking it with zero positional args prints nothing at all
+// — `eza` alone is silent, but `eza .` lists the directory fine. Give it an
+// explicit "." when the user typed a bare listing command with only flags
+// (no path argument), so passthrough `ls` actually returns something.
+const EZA_ALIASED_COMMANDS = new Set(["ls", "ll", "la", "lt", "tree"]);
+function withExplicitPathIfNeeded(command) {
+  const tokens = command.trim().split(/\s+/);
+  const [first, ...rest] = tokens;
+  if (!EZA_ALIASED_COMMANDS.has(first.toLowerCase())) return command;
+  const hasPathArg = rest.some((t) => !t.startsWith("-"));
+  return hasPathArg ? command : `${command} .`;
+}
+
+// Strip ANSI/SGR escape codes (colors, bold, etc) from command output —
+// WhatsApp renders them as literal garbage characters, it has no terminal.
+// eslint-disable-next-line no-control-regex
+const ANSI_ESCAPE_RE = /\u001b\[[0-9;]*[a-zA-Z]/g;
+function stripAnsi(text) {
+  return text.replace(ANSI_ESCAPE_RE, "");
+}
+
+function runShellCommand(rawCommand, cwd) {
+  const command = withExplicitPathIfNeeded(rawCommand);
   return new Promise((resolve, reject) => {
     const child = spawn(USER_SHELL, ["-ic", command], {
       cwd,
-      env: process.env,
+      // NO_COLOR / TERM=dumb: best-effort hint to well-behaved CLIs (git,
+      // eza, ripgrep, ...) to skip ANSI color codes entirely. stripAnsi()
+      // below is the hard guarantee for anything that ignores the hint.
+      env: { ...process.env, NO_COLOR: "1", TERM: "dumb" },
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -221,7 +247,7 @@ function runShellCommand(command, cwd) {
 
     child.on("close", (code) => {
       clearTimeout(timeout);
-      resolve({ code, output: output.trim() });
+      resolve({ code, output: stripAnsi(output).trim() });
     });
     child.on("error", (err) => {
       clearTimeout(timeout);
@@ -321,8 +347,12 @@ function runOpencode({ message, sessionId, cwd }) {
 
     const timeout = setTimeout(() => {
       child.kill("SIGTERM");
-      reject(new Error("opencode run timed out after 15 minutes"));
-    }, 15 * 60 * 1000);
+      reject(
+        new Error(
+          "a resposta demorou demais (>5min) — a sessão pode ter travado. Manda /novo e tenta de novo.",
+        ),
+      );
+    }, 5 * 60 * 1000);
 
     child.on("close", (code) => {
       clearTimeout(timeout);
@@ -333,6 +363,7 @@ function runOpencode({ message, sessionId, cwd }) {
 
       let newSessionId = sessionId || null;
       const textParts = [];
+      const toolNames = [];
 
       for (const line of stdout.split("\n")) {
         const trimmed = line.trim();
@@ -347,12 +378,22 @@ function runOpencode({ message, sessionId, cwd }) {
         if (evt.type === "text" && evt.part && typeof evt.part.text === "string") {
           textParts.push(evt.part.text);
         }
+        if (evt.part && evt.part.type === "tool" && evt.part.tool) {
+          toolNames.push(evt.part.tool);
+        }
       }
 
-      resolve({
-        sessionId: newSessionId,
-        text: textParts.join("\n").trim() || "(sem resposta em texto)",
-      });
+      // The model can legitimately finish a turn having only called tools
+      // (e.g. "check the logs") without emitting a closing text summary.
+      // Surface *something* useful instead of a bare "no text" placeholder.
+      let text = textParts.join("\n").trim();
+      if (!text) {
+        text = toolNames.length
+          ? `\u{1F527} Rodei ${toolNames.length} chamada(s) de ferramenta (${[...new Set(toolNames)].join(", ")}) mas o modelo não deixou um resumo em texto. Pergunta de novo pedindo um resumo, ou manda /novo se achar que travou.`
+          : "(sem resposta em texto — tente reformular a pergunta)";
+      }
+
+      resolve({ sessionId: newSessionId, text });
     });
 
     child.on("error", (err) => {
