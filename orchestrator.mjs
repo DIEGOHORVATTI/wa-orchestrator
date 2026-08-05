@@ -85,6 +85,9 @@ const USER_SHELL = process.env.WA_SHELL || "zsh";
 // mid-flight and, because replies are queued serially, blocked every message
 // behind it too.
 const OPENCODE_TIMEOUT_MS = Number(process.env.WA_OPENCODE_TIMEOUT_MS) || 15 * 60 * 1000;
+// Voice note transcription (optional — without a key, audio is just ignored).
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
+const TRANSCRIPTION_MODEL = process.env.WA_TRANSCRIPTION_MODEL || "google/gemini-2.5-flash";
 const START_TIME = Date.now();
 
 // The web UI routes a session under the base64url-encoded server URL it lives on.
@@ -301,6 +304,102 @@ function enqueue(fn) {
   return run;
 }
 
+const MEDIA_EXT = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/gif": "gif",
+  "image/webp": "webp",
+  "audio/ogg": "ogg",
+  "audio/mpeg": "mp3",
+  "audio/mp4": "m4a",
+};
+
+// Voice notes: no LLM here takes WhatsApp's opus/ogg directly, so transcode to
+// mp3 (ffmpeg) and let a multimodal model on OpenRouter do the transcription.
+async function transcribeAudio(file) {
+  if (!OPENROUTER_API_KEY) {
+    log("audio received but OPENROUTER_API_KEY is not set");
+    return "";
+  }
+  const mp3 = `${file}.mp3`;
+  try {
+    await new Promise((resolve, reject) => {
+      const ff = spawn("ffmpeg", ["-y", "-loglevel", "error", "-i", file, "-ar", "16000", "-ac", "1", mp3]);
+      ff.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg saiu com ${code}`))));
+      ff.on("error", reject);
+    });
+
+    const request = {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: TRANSCRIPTION_MODEL,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Transcreva o áudio literalmente, sem comentários nem formatação." },
+              {
+                type: "input_audio",
+                input_audio: { data: fs.readFileSync(mp3).toString("base64"), format: "mp3" },
+              },
+            ],
+          },
+        ],
+      }),
+    };
+
+    // One retry: a cold connection here has already failed once with a bare
+    // "fetch failed", and losing a voice note to a network hiccup is silly.
+    let res, body;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        res = await fetch("https://openrouter.ai/api/v1/chat/completions", request);
+        body = await res.json();
+        break;
+      } catch (err) {
+        if (attempt === 2) throw err;
+        log("transcription attempt", attempt, "failed:", err.message, "— retrying");
+      }
+    }
+    if (!res.ok) {
+      log("ERROR transcribing audio:", res.status, JSON.stringify(body).slice(0, 300));
+      return "";
+    }
+    const text = (body.choices?.[0]?.message?.content || "").trim();
+    log("transcribed audio,", text.length, "chars");
+    return text;
+  } catch (err) {
+    // fetch() hides the real network/TLS error in .cause
+    log("ERROR transcribing audio:", err.message, "| cause:", err.cause?.message || "-");
+    return "";
+  } finally {
+    fs.rmSync(mp3, { force: true });
+  }
+}
+
+// The bridge inlines an attachment as base64. Models can't be handed base64,
+// but opencode's `read` tool handles image files, so drop it on disk and point
+// the prompt at the path.
+function saveIncomingMedia(payload) {
+  if (!payload.mediaBase64) return null;
+  const ext = MEDIA_EXT[payload.mimeType] || (payload.mediaFilename || "").split(".").pop() || "bin";
+  const dir = path.join(os.tmpdir(), "wa-media");
+  const file = path.join(dir, `${payload.messageId || Date.now()}.${ext}`);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(file, Buffer.from(payload.mediaBase64, "base64"));
+    log("saved incoming", payload.mediaType, "->", file);
+    return { path: file, type: payload.mediaType || "" };
+  } catch (err) {
+    log("ERROR saving incoming media:", err.message);
+    return null;
+  }
+}
+
 // Last resort when the CLI stream ended without the closing text: read the
 // answer straight off the session. The final part can land a moment after the
 // client exits, so retry briefly before giving up.
@@ -483,7 +582,9 @@ async function handleIncomingMessage(payload) {
   }
   if (payload.isFromMe) return;
   if (payload.eventType && payload.eventType !== "message") return;
-  if (!payload.content || !payload.content.trim()) return;
+  // A photo often arrives with no caption at all — that's still a message.
+  const hasMedia = Boolean(payload.mediaBase64);
+  if (!hasMedia && (!payload.content || !payload.content.trim())) return;
 
   if (payload.messageId) {
     if (recentMessageIds.has(payload.messageId)) return;
@@ -498,7 +599,7 @@ async function handleIncomingMessage(payload) {
   const entry = state[ALLOWED_NUMBER] || {};
   const cwd = entry.cwd || OPENCODE_CWD;
   const chatTarget = payload.chatJID || senderNumber;
-  const raw = payload.content.trim();
+  const raw = (payload.content || "").trim();
   const normalized = raw.toLowerCase();
   log("incoming from", senderNumber, "->", JSON.stringify(payload.content).slice(0, 200));
 
@@ -585,7 +686,20 @@ async function handleIncomingMessage(payload) {
     // into sibling/parent directories. A short explicit reminder on every
     // turn keeps it scoped to what you actually `cd`'d into, without
     // pretending this is real filesystem isolation (it isn't).
-    const scopedMessage = `[contexto: diretório de trabalho atual é ${cwd} — fique restrito a esse diretório e seus subdiretórios, a menos que eu peça algo fora dele explicitamente]\n\n${payload.content}`;
+    const media = saveIncomingMedia(payload);
+    let attachment = "";
+    let transcript = "";
+    if (media?.type === "audio") {
+      transcript = await transcribeAudio(media.path);
+      if (!transcript) {
+        await sendWhatsApp(chatTarget, "⚠️ Não consegui transcrever esse áudio.");
+        return;
+      }
+    } else if (media) {
+      attachment = `\n\n[${media.type || "arquivo"} anexado a esta mensagem: ${media.path} — abra com a ferramenta read]`;
+    }
+    const body = [raw, transcript].filter(Boolean).join("\n\n") || (media ? "(sem legenda — veja o anexo)" : "");
+    const scopedMessage = `[contexto: diretório de trabalho atual é ${cwd} — fique restrito a esse diretório e seus subdiretórios, a menos que eu peça algo fora dele explicitamente]\n\n${body}${attachment}`;
 
     const { sessionId, text } = await runOpencode({
       message: scopedMessage,

@@ -109,6 +109,16 @@ Note: deleting/clearing a chat on your phone does **not** reset anything —
 that's a local, device-only action WhatsApp never syncs to linked devices.
 Use `/novo` explicitly when you want a clean slate.
 
+## Photos and voice notes
+
+Send a photo (with or without a caption) and it is written to disk, with the
+path handed to OpenCode — its `read` tool opens images, so you can ask "what's
+the error in this screenshot?".
+
+Send a voice note and it is transcoded to mp3 (`ffmpeg`) and transcribed by a
+multimodal model on OpenRouter; the transcript becomes the message. Set
+`OPENROUTER_API_KEY` to enable it — without a key, audio gets an error reply.
+
 ## Terminal passthrough
 
 Messages whose first word matches a small allowlist (`cd`, `ls`, `pwd`,
