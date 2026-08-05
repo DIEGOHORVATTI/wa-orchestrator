@@ -87,9 +87,10 @@ const USER_SHELL = process.env.WA_SHELL || "zsh";
 const OPENCODE_TIMEOUT_MS = Number(process.env.WA_OPENCODE_TIMEOUT_MS) || 15 * 60 * 1000;
 const START_TIME = Date.now();
 
-// The web UI addresses a project by its cwd base64url-encoded (no padding).
-function sessionWebUrl(cwd, sessionId) {
-  return `${OPENCODE_SERVER_URL}/${Buffer.from(cwd).toString("base64url")}/session/${sessionId}`;
+// The web UI routes a session under the base64url-encoded server URL it lives on.
+function sessionWebUrl(sessionId) {
+  const server = Buffer.from(OPENCODE_SERVER_URL).toString("base64url");
+  return `${OPENCODE_SERVER_URL}/server/${server}/session/${sessionId}`;
 }
 
 function log(...args) {
@@ -300,6 +301,35 @@ function enqueue(fn) {
   return run;
 }
 
+// Last resort when the CLI stream ended without the closing text: read the
+// answer straight off the session. The final part can land a moment after the
+// client exits, so retry briefly before giving up.
+async function fetchLastAssistantText(sessionId, attempts = 5) {
+  if (!sessionId) return "";
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(`${OPENCODE_SERVER_URL}/session/${sessionId}/message`);
+      if (res.ok) {
+        const messages = await res.json();
+        const last = [...messages].reverse().find((m) => m.info?.role === "assistant");
+        const text = (last?.parts || [])
+          .filter((p) => p.type === "text" && p.text)
+          .map((p) => p.text)
+          .join("\n")
+          .trim();
+        if (text) {
+          log("recovered text from session", sessionId, "after", i + 1, "try(ies)");
+          return text;
+        }
+      }
+    } catch (err) {
+      log("ERROR fetching session messages:", err.message);
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  return "";
+}
+
 async function sendWhatsApp(recipient, message) {
   const res = await fetch(`${BRIDGE_URL}/api/send`, {
     method: "POST",
@@ -420,17 +450,23 @@ function runOpencode({ message, sessionId, cwd }) {
         }
       }
 
-      // The model can legitimately finish a turn having only called tools
-      // (e.g. "check the logs") without emitting a closing text summary.
-      // Surface *something* useful instead of a bare "no text" placeholder.
-      let text = textParts.join("\n").trim();
-      if (!text) {
-        text = toolNames.length
-          ? `\u{1F527} Rodei ${toolNames.length} chamada(s) de ferramenta (${[...new Set(toolNames)].join(", ")}) mas o modelo não deixou um resumo em texto. Pergunta de novo pedindo um resumo, ou manda /novo se achar que travou.`
-          : "(sem resposta em texto — tente reformular a pergunta)";
-      }
-
-      resolve({ sessionId: newSessionId, text });
+      // `opencode run --attach` sometimes ends its stream one step early,
+      // right before the closing text part — the answer *is* in the session
+      // on the server, it just never reached stdout. Ask the server for it
+      // instead of claiming the model went quiet.
+      const streamed = textParts.join("\n").trim();
+      const finish = async () => {
+        let text = streamed || (await fetchLastAssistantText(newSessionId));
+        if (!text) {
+          // A turn that genuinely only ran tools (e.g. "check the logs")
+          // without writing any closing summary.
+          text = toolNames.length
+            ? `\u{1F527} Rodei ${toolNames.length} chamada(s) de ferramenta (${[...new Set(toolNames)].join(", ")}) mas o modelo não deixou um resumo em texto. Pergunta de novo pedindo um resumo, ou manda /novo se achar que travou.`
+            : "(sem resposta em texto — tente reformular a pergunta)";
+        }
+        return { sessionId: newSessionId, text };
+      };
+      finish().then(resolve, reject);
     });
 
     child.on("error", (err) => {
@@ -495,7 +531,7 @@ async function handleIncomingMessage(payload) {
       `Servidor opencode (${OPENCODE_SERVER_URL}): ${healthy ? "\u2705 online" : "\u26A0\uFE0F sem resposta"}`,
     ];
     if (entry.sessionId) {
-      lines.push(`Abrir na web: ${sessionWebUrl(cwd, entry.sessionId)}`);
+      lines.push(`Abrir na web: ${sessionWebUrl(entry.sessionId)}`);
     }
     await sendWhatsApp(chatTarget, markdownToWhatsApp(lines.join("\n")));
     log("status requested");
