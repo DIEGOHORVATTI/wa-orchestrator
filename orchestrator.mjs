@@ -80,7 +80,17 @@ const OPENCODE_SERVER_URL = process.env.WA_OPENCODE_SERVER_URL || "http://127.0.
 // `git checkout`) resolve — plain `sh -c` / non-interactive shells don't
 // load rc files and won't know about them.
 const USER_SHELL = process.env.WA_SHELL || "zsh";
+// An exploratory question over a big repo ("como está esse projeto?") can easily
+// run 5-10min of tool calls before the model writes a word. 5min killed those
+// mid-flight and, because replies are queued serially, blocked every message
+// behind it too.
+const OPENCODE_TIMEOUT_MS = Number(process.env.WA_OPENCODE_TIMEOUT_MS) || 15 * 60 * 1000;
 const START_TIME = Date.now();
+
+// The web UI addresses a project by its cwd base64url-encoded (no padding).
+function sessionWebUrl(cwd, sessionId) {
+  return `${OPENCODE_SERVER_URL}/${Buffer.from(cwd).toString("base64url")}/session/${sessionId}`;
+}
 
 function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.map(String).join(" ")}\n`;
@@ -303,7 +313,34 @@ async function sendWhatsApp(recipient, message) {
   if (!res.ok || body.success === false) {
     log("ERROR sending WhatsApp reply:", res.status, JSON.stringify(body));
   }
-  return body;
+  return body; // { success, message, message_id }
+}
+
+// "Delete for everyone" the given message. WhatsApp only allows revoking
+// messages the sending account itself sent — this can only ever remove the
+// bot's own replies, never anything the human side of the chat sent from
+// their phone. That's a WhatsApp protocol limitation, not something this
+// bridge can work around.
+async function revokeWhatsApp(recipient, messageId) {
+  try {
+    const res = await fetch(`${BRIDGE_URL}/api/revoke`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${bridgeToken}`,
+      },
+      body: JSON.stringify({ recipient, message_id: messageId }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.success === false) {
+      log("WARN could not revoke message", messageId, JSON.stringify(body));
+      return false;
+    }
+    return true;
+  } catch (err) {
+    log("WARN revoke request failed:", messageId, err.message);
+    return false;
+  }
 }
 
 function runOpencode({ message, sessionId, cwd }) {
@@ -347,12 +384,12 @@ function runOpencode({ message, sessionId, cwd }) {
 
     const timeout = setTimeout(() => {
       child.kill("SIGTERM");
-      reject(
-        new Error(
-          "a resposta demorou demais (>5min) — a sessão pode ter travado. Manda /novo e tenta de novo.",
-        ),
+      const err = new Error(
+        `a resposta demorou demais (>${Math.round(OPENCODE_TIMEOUT_MS / 60000)}min). Descartei essa sessão — a próxima mensagem começa uma nova.`,
       );
-    }, 5 * 60 * 1000);
+      err.timedOut = true;
+      reject(err);
+    }, OPENCODE_TIMEOUT_MS);
 
     child.on("close", (code) => {
       clearTimeout(timeout);
@@ -432,7 +469,7 @@ async function handleIncomingMessage(payload) {
   // Manual session reset. WhatsApp never tells us when you clear/delete a
   // chat locally on your phone (that's a device-local action, not synced to
   // linked devices), so the only reliable way to start fresh is this command.
-  if (["/novo", "/new", "/reset", "/limpar"].includes(normalized)) {
+  if (["/novo", "/new", "/reset", "/limpar", "/clear"].includes(normalized)) {
     // Reset the conversation but keep wherever `cd` last left you.
     if (entry.cwd) {
       state[ALLOWED_NUMBER] = { cwd: entry.cwd };
@@ -457,6 +494,9 @@ async function handleIncomingMessage(payload) {
       `Sessão ativa: ${entry.sessionId ? `\`${entry.sessionId}\`` : "nenhuma (próxima mensagem cria uma nova)"}`,
       `Servidor opencode (${OPENCODE_SERVER_URL}): ${healthy ? "\u2705 online" : "\u26A0\uFE0F sem resposta"}`,
     ];
+    if (entry.sessionId) {
+      lines.push(`Abrir na web: ${sessionWebUrl(cwd, entry.sessionId)}`);
+    }
     await sendWhatsApp(chatTarget, markdownToWhatsApp(lines.join("\n")));
     log("status requested");
     return;
@@ -520,13 +560,19 @@ async function handleIncomingMessage(payload) {
     state[ALLOWED_NUMBER] = { ...entry, sessionId, updatedAt: new Date().toISOString() };
     saveState(state);
 
-    const footer = sessionId
-      ? `\n\n\u{1F9F5} \`\`\`opencode -s "${sessionId}"\`\`\``
-      : "";
-    await sendWhatsApp(chatTarget, markdownToWhatsApp(`${text}${footer}`));
+    await sendWhatsApp(chatTarget, markdownToWhatsApp(text));
     log("replied, session=", sessionId);
   } catch (err) {
     log("ERROR running opencode:", err.message);
+    // Killing the client on timeout does NOT stop the run on the warm server:
+    // the session stays busy there, so every later message reusing that same
+    // session id queues behind it and times out too. Drop the session so the
+    // next message starts a fresh one instead of snowballing.
+    if (err.timedOut && entry.sessionId) {
+      state[ALLOWED_NUMBER] = { cwd, updatedAt: new Date().toISOString() };
+      saveState(state);
+      log("dropped stuck session", entry.sessionId);
+    }
     await sendWhatsApp(
       chatTarget,
       markdownToWhatsApp(`\u26A0\uFE0F Erro processando sua mensagem: ${err.message}`),

@@ -3,13 +3,10 @@
 Turn your own WhatsApp number into a remote control for [OpenCode](https://opencode.ai).
 Send a message from your phone, [OpenCode](https://opencode.ai) runs it (with full tool access —
 bash, file edits, MCP servers, whatever your `opencode` config exposes), and the answer
-comes back on WhatsApp, formatted for WhatsApp (not raw GitHub markdown), with the
-session id in the footer so you can pick the same conversation back up from a terminal
-with:
+comes back on WhatsApp, formatted for WhatsApp (not raw GitHub markdown).
 
-```bash
-opencode -s "ses_xxxxxxxxxxxxxxxxxxxx"
-```
+To pick the same conversation back up elsewhere, send `/status`: it returns the active
+session id and a link that opens it in the OpenCode web UI.
 
 Only one phone number is ever allowed to talk to it — every other contact is silently
 ignored, on purpose. This is a personal remote control, not a public bot.
@@ -105,8 +102,8 @@ Send these as WhatsApp messages to control the bot itself (case-insensitive):
 
 | Command | Effect |
 | --- | --- |
-| `/novo`, `/new`, `/reset`, `/limpar` | Discard the current session; the next message starts a brand new OpenCode conversation. Keeps whatever directory `cd` last left you in. |
-| `/status` | Uptime, current directory, active session id, warm-server health. |
+| `/novo`, `/new`, `/reset`, `/limpar`, `/clear` | Discard the current session; the next message starts a brand new OpenCode conversation. Keeps whatever directory `cd` last left you in. |
+| `/status` | Uptime, current directory, active session id + web UI link, warm-server health. |
 
 Note: deleting/clearing a chat on your phone does **not** reset anything —
 that's a local, device-only action WhatsApp never syncs to linked devices.
