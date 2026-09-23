@@ -1,23 +1,10 @@
 #!/usr/bin/env node
-// WhatsApp -> OpenCode orchestrator
-//
-// Receives incoming-message webhooks from the whatsapp-mcp bridge and routes
-// them into `opencode run --session <id>`, replying back over WhatsApp with
-// the answer plus the session id so the user can resume from any machine
-// with: opencode -s "<session id>"
-//
-// Only messages from ALLOWED_NUMBER are processed. Everything else is
-// ignored (no replies are ever sent to any other contact).
-
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
 
-// Minimal .env loader (no dependency): KEY=VALUE lines, '#' comments, blank
-// lines ignored. Never overrides a variable already set in the real
-// environment (systemd Environment=, shell export, etc take precedence).
 function loadDotEnv(file) {
   let content;
   try {
@@ -52,10 +39,6 @@ const TOKEN_FILE = path.join(BRIDGE_DIR, "store", ".bridge-token");
 const STATE_FILE = path.join(HOME, "whatsapp-mcp", "wa-orchestrator", "state.json");
 const LOG_FILE = path.join(HOME, "whatsapp-mcp", "wa-orchestrator", "orchestrator.log");
 
-// The only WhatsApp number this bot will ever process messages from or
-// reply to. REQUIRED — there is no sane default, and the process refuses to
-// start without it so a misconfiguration can never accidentally reply to
-// (or leak responses to) an unintended contact.
 const ALLOWED_NUMBER = (process.env.WA_ALLOWED_NUMBER || "").replace(/\D/g, "");
 if (!ALLOWED_NUMBER) {
   console.error(
@@ -68,33 +51,14 @@ if (!ALLOWED_NUMBER) {
 
 const ORCH_PORT = Number(process.env.WA_ORCH_PORT || 8090);
 const BRIDGE_URL = process.env.WA_BRIDGE_URL || "http://127.0.0.1:8080";
-const OPENCODE_CWD = process.env.WA_OPENCODE_CWD || path.join(HOME, "Dev", "agnus");
-const OPENCODE_BIN = process.env.WA_OPENCODE_BIN || "opencode";
-// Attach to a warm `opencode serve` instead of spawning a fresh process per
-// message: a cold `opencode run` re-initializes every configured MCP server
-// (n8n, cloudflare docs, whatsapp, etc.) which can take 1-2+ minutes. The
-// warm server keeps that state loaded, cutting typical replies to ~10s.
-const OPENCODE_SERVER_URL = process.env.WA_OPENCODE_SERVER_URL || "http://127.0.0.1:4096";
-// Shell used to run raw commands (see SHELL_COMMANDS below). Must be an
-// interactive-capable login shell so aliases like `gco` (oh-my-zsh's
-// `git checkout`) resolve — plain `sh -c` / non-interactive shells don't
-// load rc files and won't know about them.
+const CLAUDE_CWD = process.env.WA_CLAUDE_CWD || path.join(HOME, "Dev", "agnus");
+const CLAUDE_BIN = process.env.WA_CLAUDE_BIN || "claude";
+const CLAUDE_PERMISSION_MODE = process.env.WA_CLAUDE_PERMISSION_MODE || "auto";
 const USER_SHELL = process.env.WA_SHELL || "zsh";
-// An exploratory question over a big repo ("como está esse projeto?") can easily
-// run 5-10min of tool calls before the model writes a word. 5min killed those
-// mid-flight and, because replies are queued serially, blocked every message
-// behind it too.
-const OPENCODE_TIMEOUT_MS = Number(process.env.WA_OPENCODE_TIMEOUT_MS) || 15 * 60 * 1000;
-// Voice note transcription (optional — without a key, audio is just ignored).
+const CLAUDE_TIMEOUT_MS = Number(process.env.WA_CLAUDE_TIMEOUT_MS) || 15 * 60 * 1000;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const TRANSCRIPTION_MODEL = process.env.WA_TRANSCRIPTION_MODEL || "google/gemini-2.5-flash";
 const START_TIME = Date.now();
-
-// The web UI routes a session under the base64url-encoded server URL it lives on.
-function sessionWebUrl(sessionId) {
-  const server = Buffer.from(OPENCODE_SERVER_URL).toString("base64url");
-  return `${OPENCODE_SERVER_URL}/server/${server}/session/${sessionId}`;
-}
 
 function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.map(String).join(" ")}\n`;
@@ -102,7 +66,6 @@ function log(...args) {
   try {
     fs.appendFileSync(LOG_FILE, line);
   } catch {
-    // best effort
   }
 }
 
@@ -128,35 +91,22 @@ function saveState(state) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-// WhatsApp does not render GitHub-flavored markdown. It has its own minimal
-// formatting: *bold* (single asterisk), _italic_, ~strikethrough~, and
-// ```code```. Convert the common markdown opencode produces into that, and
-// strip constructs WhatsApp has no equivalent for (tables, headers, links).
 function markdownToWhatsApp(text) {
   let out = text;
 
-  // Fenced code blocks: protect their contents from the rest of the pass by
-  // extracting them first, then splicing them back in untouched at the end.
   const codeBlocks = [];
   out = out.replace(/```[\s\S]*?```/g, (m) => {
     codeBlocks.push(m);
     return `\u0000CODEBLOCK${codeBlocks.length - 1}\u0000`;
   });
 
-  // Bold: **text** or __text__ -> *text*
   out = out.replace(/\*\*(.+?)\*\*/g, "*$1*");
   out = out.replace(/__(.+?)__/g, "*$1*");
 
-  // Italic markdown (single _text_) already matches WhatsApp; leave as-is.
-
-  // Headers: "# Title" / "## Title" -> "*Title*"
   out = out.replace(/^#{1,6}\s+(.+)$/gm, "*$1*");
 
-  // Markdown links [label](url) -> "label (url)"
   out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, "$1 ($2)");
 
-  // Tables: WhatsApp has no table rendering. Drop the "|---|---|" separator
-  // rows and turn remaining "| a | b |" rows into "a: b" / "a - b" lines.
   out = out
     .split("\n")
     .filter((line) => !/^\s*\|?[\s:|-]+\|[\s:|-]*\|?\s*$/.test(line) || !line.includes("-"))
@@ -168,21 +118,13 @@ function markdownToWhatsApp(text) {
     })
     .join("\n");
 
-  // Bullet markers "- " / "* " at line start -> "• " (avoids stray literal
-  // "*" being misread as bold-open by WhatsApp's own renderer).
   out = out.replace(/^(\s*)[-*]\s+/gm, "$1\u2022 ");
 
-  // Restore protected code blocks.
   out = out.replace(/\u0000CODEBLOCK(\d+)\u0000/g, (_, i) => codeBlocks[Number(i)]);
 
   return out.trim();
 }
 
-// First-word allowlist: messages whose first token matches one of these are
-// treated as literal shell commands (run directly, no LLM involved) instead
-// of an OpenCode prompt. Covers navigation, inspection, and common git/
-// oh-my-zsh git-plugin aliases. Extend via WA_SHELL_COMMANDS (comma
-// separated) if you use others.
 const DEFAULT_SHELL_COMMANDS = [
   "ls", "ll", "la", "lt", "pwd", "git", "whoami", "date", "echo", "cat",
   "head", "tail", "wc", "find", "grep", "du", "df", "top", "ps", "which",
@@ -197,17 +139,13 @@ const SHELL_COMMANDS = new Set(
   ).map((c) => c.toLowerCase()),
 );
 
-const MAX_REPLY_CHARS = 3500; // stay well under WhatsApp's own message cap
+const MAX_REPLY_CHARS = 3500;
 
 function truncate(text) {
   if (text.length <= MAX_REPLY_CHARS) return text;
   return `${text.slice(0, MAX_REPLY_CHARS)}\n… (cortado, ${text.length} chars no total)`;
 }
 
-// Resolve a `cd` argument against the tracked current directory. Mirrors
-// plain shell semantics for the cases that matter here: no arg / "~" -> HOME,
-// "~/x" -> HOME/x, relative paths resolved against currentCwd, absolute
-// paths used as-is. "cd -" (previous dir) is intentionally not supported.
 function resolveCdTarget(currentCwd, arg) {
   if (!arg || arg === "~") return HOME;
   let target = arg;
@@ -216,11 +154,6 @@ function resolveCdTarget(currentCwd, arg) {
   return path.normalize(target);
 }
 
-// `eza` (this box's `ls`/`ll`/`la`/`lt`/`tree` alias target, see .zshrc) has
-// a quirk where invoking it with zero positional args prints nothing at all
-// — `eza` alone is silent, but `eza .` lists the directory fine. Give it an
-// explicit "." when the user typed a bare listing command with only flags
-// (no path argument), so passthrough `ls` actually returns something.
 const EZA_ALIASED_COMMANDS = new Set(["ls", "ll", "la", "lt", "tree"]);
 function withExplicitPathIfNeeded(command) {
   const tokens = command.trim().split(/\s+/);
@@ -230,9 +163,6 @@ function withExplicitPathIfNeeded(command) {
   return hasPathArg ? command : `${command} .`;
 }
 
-// Strip ANSI/SGR escape codes (colors, bold, etc) from command output —
-// WhatsApp renders them as literal garbage characters, it has no terminal.
-// eslint-disable-next-line no-control-regex
 const ANSI_ESCAPE_RE = /\u001b\[[0-9;]*[a-zA-Z]/g;
 function stripAnsi(text) {
   return text.replace(ANSI_ESCAPE_RE, "");
@@ -243,9 +173,6 @@ function runShellCommand(rawCommand, cwd) {
   return new Promise((resolve, reject) => {
     const child = spawn(USER_SHELL, ["-ic", command], {
       cwd,
-      // NO_COLOR / TERM=dumb: best-effort hint to well-behaved CLIs (git,
-      // eza, ripgrep, ...) to skip ANSI color codes entirely. stripAnsi()
-      // below is the hard guarantee for anything that ignores the hint.
       env: { ...process.env, NO_COLOR: "1", TERM: "dumb" },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -270,18 +197,6 @@ function runShellCommand(rawCommand, cwd) {
   });
 }
 
-async function checkOpencodeServerHealth() {
-  try {
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), 3000);
-    const res = await fetch(`${OPENCODE_SERVER_URL}/doc`, { signal: controller.signal });
-    clearTimeout(t);
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
 function formatUptime(ms) {
   const s = Math.floor(ms / 1000);
   const h = Math.floor(s / 3600);
@@ -293,10 +208,6 @@ function formatUptime(ms) {
 const bridgeToken = readBridgeToken();
 const recentMessageIds = new Set();
 
-// Serialize all opencode invocations. Running two `opencode run --attach`
-// calls concurrently against the same warm server has been observed to
-// deadlock both requests indefinitely (never completing, no error). One
-// message is processed fully before the next one starts.
 let queueTail = Promise.resolve();
 function enqueue(fn) {
   const run = queueTail.then(fn, fn);
@@ -314,8 +225,6 @@ const MEDIA_EXT = {
   "audio/mp4": "m4a",
 };
 
-// Voice notes: no LLM here takes WhatsApp's opus/ogg directly, so transcode to
-// mp3 (ffmpeg) and let a multimodal model on OpenRouter do the transcription.
 async function transcribeAudio(file) {
   if (!OPENROUTER_API_KEY) {
     log("audio received but OPENROUTER_API_KEY is not set");
@@ -352,8 +261,6 @@ async function transcribeAudio(file) {
       }),
     };
 
-    // One retry: a cold connection here has already failed once with a bare
-    // "fetch failed", and losing a voice note to a network hiccup is silly.
     let res, body;
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
@@ -373,7 +280,6 @@ async function transcribeAudio(file) {
     log("transcribed audio,", text.length, "chars");
     return text;
   } catch (err) {
-    // fetch() hides the real network/TLS error in .cause
     log("ERROR transcribing audio:", err.message, "| cause:", err.cause?.message || "-");
     return "";
   } finally {
@@ -381,9 +287,6 @@ async function transcribeAudio(file) {
   }
 }
 
-// The bridge inlines an attachment as base64. Models can't be handed base64,
-// but opencode's `read` tool handles image files, so drop it on disk and point
-// the prompt at the path.
 function saveIncomingMedia(payload) {
   if (!payload.mediaBase64) return null;
   const ext = MEDIA_EXT[payload.mimeType] || (payload.mediaFilename || "").split(".").pop() || "bin";
@@ -400,35 +303,6 @@ function saveIncomingMedia(payload) {
   }
 }
 
-// Last resort when the CLI stream ended without the closing text: read the
-// answer straight off the session. The final part can land a moment after the
-// client exits, so retry briefly before giving up.
-async function fetchLastAssistantText(sessionId, attempts = 5) {
-  if (!sessionId) return "";
-  for (let i = 0; i < attempts; i++) {
-    try {
-      const res = await fetch(`${OPENCODE_SERVER_URL}/session/${sessionId}/message`);
-      if (res.ok) {
-        const messages = await res.json();
-        const last = [...messages].reverse().find((m) => m.info?.role === "assistant");
-        const text = (last?.parts || [])
-          .filter((p) => p.type === "text" && p.text)
-          .map((p) => p.text)
-          .join("\n")
-          .trim();
-        if (text) {
-          log("recovered text from session", sessionId, "after", i + 1, "try(ies)");
-          return text;
-        }
-      }
-    } catch (err) {
-      log("ERROR fetching session messages:", err.message);
-    }
-    await new Promise((r) => setTimeout(r, 2000));
-  }
-  return "";
-}
-
 async function sendWhatsApp(recipient, message) {
   const res = await fetch(`${BRIDGE_URL}/api/send`, {
     method: "POST",
@@ -442,14 +316,9 @@ async function sendWhatsApp(recipient, message) {
   if (!res.ok || body.success === false) {
     log("ERROR sending WhatsApp reply:", res.status, JSON.stringify(body));
   }
-  return body; // { success, message, message_id }
+  return body;
 }
 
-// "Delete for everyone" the given message. WhatsApp only allows revoking
-// messages the sending account itself sent — this can only ever remove the
-// bot's own replies, never anything the human side of the chat sent from
-// their phone. That's a WhatsApp protocol limitation, not something this
-// bridge can work around.
 async function revokeWhatsApp(recipient, messageId) {
   try {
     const res = await fetch(`${BRIDGE_URL}/api/revoke`, {
@@ -472,37 +341,29 @@ async function revokeWhatsApp(recipient, messageId) {
   }
 }
 
-function runOpencode({ message, sessionId, cwd }) {
+function runClaude({ message, sessionId, sessionCwd, cwd }) {
   return new Promise((resolve, reject) => {
-    // --auto is required here: headless mode has no TTY to approve tool
-    // permission prompts (bash, file edits, etc). Without it, any tool call
-    // hangs forever waiting for an approval that can never arrive.
-    // --attach reuses the warm opencode-server.service instead of paying
-    // full MCP-server cold-start cost on every single message.
+    const spawnCwd = sessionId && sessionCwd ? sessionCwd : cwd;
     const args = [
-      "run",
+      "-p",
       message,
-      "--format",
+      "--output-format",
       "json",
-      "--auto",
-      "--attach",
-      OPENCODE_SERVER_URL,
-      "--dir",
-      cwd,
+      "--permission-mode",
+      CLAUDE_PERMISSION_MODE,
     ];
     if (sessionId) {
-      args.push("--session", sessionId);
+      args.push("--resume", sessionId);
+    }
+    if (spawnCwd !== cwd) {
+      args.push("--add-dir", cwd);
     }
 
-    log("spawning:", OPENCODE_BIN, JSON.stringify(args), "cwd=", cwd);
+    log("spawning:", CLAUDE_BIN, JSON.stringify(args), "cwd=", spawnCwd);
 
-    const child = spawn(OPENCODE_BIN, args, {
-      cwd,
+    const child = spawn(CLAUDE_BIN, args, {
+      cwd: spawnCwd,
       env: process.env,
-      // stdin MUST be closed/ignored: opencode run reads stdin (to support
-      // piped input) and hangs forever waiting for EOF if left as an open,
-      // unwritten pipe (child_process's default). This was the root cause
-      // of every message getting stuck indefinitely with no error.
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -514,58 +375,26 @@ function runOpencode({ message, sessionId, cwd }) {
     const timeout = setTimeout(() => {
       child.kill("SIGTERM");
       const err = new Error(
-        `a resposta demorou demais (>${Math.round(OPENCODE_TIMEOUT_MS / 60000)}min). Descartei essa sessão — a próxima mensagem começa uma nova.`,
+        `a resposta demorou demais (>${Math.round(CLAUDE_TIMEOUT_MS / 60000)}min). Tente de novo, ou mande /novo para começar outra conversa.`,
       );
-      err.timedOut = true;
       reject(err);
-    }, OPENCODE_TIMEOUT_MS);
+    }, CLAUDE_TIMEOUT_MS);
 
     child.on("close", (code) => {
       clearTimeout(timeout);
-      if (code !== 0 && !stdout.trim()) {
-        reject(new Error(`opencode exited with code ${code}: ${stderr.slice(-2000)}`));
+      let out;
+      try {
+        out = JSON.parse(stdout.trim());
+      } catch {
+        reject(new Error(`claude exited with code ${code}: ${(stderr || stdout).slice(-2000)}`));
         return;
       }
-
-      let newSessionId = sessionId || null;
-      const textParts = [];
-      const toolNames = [];
-
-      for (const line of stdout.split("\n")) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        let evt;
-        try {
-          evt = JSON.parse(trimmed);
-        } catch {
-          continue;
-        }
-        if (evt.sessionID) newSessionId = evt.sessionID;
-        if (evt.type === "text" && evt.part && typeof evt.part.text === "string") {
-          textParts.push(evt.part.text);
-        }
-        if (evt.part && evt.part.type === "tool" && evt.part.tool) {
-          toolNames.push(evt.part.tool);
-        }
-      }
-
-      // `opencode run --attach` sometimes ends its stream one step early,
-      // right before the closing text part — the answer *is* in the session
-      // on the server, it just never reached stdout. Ask the server for it
-      // instead of claiming the model went quiet.
-      const streamed = textParts.join("\n").trim();
-      const finish = async () => {
-        let text = streamed || (await fetchLastAssistantText(newSessionId));
-        if (!text) {
-          // A turn that genuinely only ran tools (e.g. "check the logs")
-          // without writing any closing summary.
-          text = toolNames.length
-            ? `\u{1F527} Rodei ${toolNames.length} chamada(s) de ferramenta (${[...new Set(toolNames)].join(", ")}) mas o modelo não deixou um resumo em texto. Pergunta de novo pedindo um resumo, ou manda /novo se achar que travou.`
-            : "(sem resposta em texto — tente reformular a pergunta)";
-        }
-        return { sessionId: newSessionId, text };
-      };
-      finish().then(resolve, reject);
+      const text =
+        (typeof out.result === "string" && out.result.trim()) ||
+        (out.is_error
+          ? `(o Claude parou com erro: ${out.subtype || "desconhecido"})`
+          : "(sem resposta em texto — tente reformular a pergunta)");
+      resolve({ sessionId: out.session_id || sessionId || null, text });
     });
 
     child.on("error", (err) => {
@@ -578,11 +407,10 @@ function runOpencode({ message, sessionId, cwd }) {
 async function handleIncomingMessage(payload) {
   const senderNumber = String(payload.sender || "").split("@")[0].split(":")[0];
   if (senderNumber !== ALLOWED_NUMBER) {
-    return; // never process or reply to anyone else
+    return;
   }
   if (payload.isFromMe) return;
   if (payload.eventType && payload.eventType !== "message") return;
-  // A photo often arrives with no caption at all — that's still a message.
   const hasMedia = Boolean(payload.mediaBase64);
   if (!hasMedia && (!payload.content || !payload.content.trim())) return;
 
@@ -597,17 +425,13 @@ async function handleIncomingMessage(payload) {
 
   const state = loadState();
   const entry = state[ALLOWED_NUMBER] || {};
-  const cwd = entry.cwd || OPENCODE_CWD;
+  const cwd = entry.cwd || CLAUDE_CWD;
   const chatTarget = payload.chatJID || senderNumber;
   const raw = (payload.content || "").trim();
   const normalized = raw.toLowerCase();
   log("incoming from", senderNumber, "->", JSON.stringify(payload.content).slice(0, 200));
 
-  // Manual session reset. WhatsApp never tells us when you clear/delete a
-  // chat locally on your phone (that's a device-local action, not synced to
-  // linked devices), so the only reliable way to start fresh is this command.
   if (["/novo", "/new", "/reset", "/limpar", "/clear"].includes(normalized)) {
-    // Reset the conversation but keep wherever `cd` last left you.
     if (entry.cwd) {
       state[ALLOWED_NUMBER] = { cwd: entry.cwd };
     } else {
@@ -623,23 +447,20 @@ async function handleIncomingMessage(payload) {
   }
 
   if (normalized === "/status") {
-    const healthy = await checkOpencodeServerHealth();
     const lines = [
       "*Status do orquestrador*",
       `Uptime: ${formatUptime(Date.now() - START_TIME)}`,
       `Diretório atual: \`${cwd}\``,
       `Sessão ativa: ${entry.sessionId ? `\`${entry.sessionId}\`` : "nenhuma (próxima mensagem cria uma nova)"}`,
-      `Servidor opencode (${OPENCODE_SERVER_URL}): ${healthy ? "\u2705 online" : "\u26A0\uFE0F sem resposta"}`,
     ];
     if (entry.sessionId) {
-      lines.push(`Abrir na web: ${sessionWebUrl(entry.sessionId)}`);
+      lines.push(`Continuar no terminal: \`cd ${entry.sessionCwd || cwd} && claude -r ${entry.sessionId}\``);
     }
     await sendWhatsApp(chatTarget, markdownToWhatsApp(lines.join("\n")));
     log("status requested");
     return;
   }
 
-  // First-token dispatch: literal shell commands vs. an OpenCode prompt.
   const firstWord = raw.split(/\s+/)[0]?.toLowerCase();
 
   if (firstWord === "cd") {
@@ -680,12 +501,6 @@ async function handleIncomingMessage(payload) {
   }
 
   try {
-    // `--dir` only sets the *initial* working directory — it is not a
-    // sandbox. The model's bash tool can `cd ..` or use absolute paths
-    // freely, so a vague prompt like "esses repos" can easily make it wander
-    // into sibling/parent directories. A short explicit reminder on every
-    // turn keeps it scoped to what you actually `cd`'d into, without
-    // pretending this is real filesystem isolation (it isn't).
     const media = saveIncomingMedia(payload);
     let attachment = "";
     let transcript = "";
@@ -696,33 +511,26 @@ async function handleIncomingMessage(payload) {
         return;
       }
     } else if (media) {
-      attachment = `\n\n[${media.type || "arquivo"} anexado a esta mensagem: ${media.path} — abra com a ferramenta read]`;
+      attachment = `\n\n[${media.type || "arquivo"} anexado a esta mensagem: ${media.path} — abra com a ferramenta Read]`;
     }
     const body = [raw, transcript].filter(Boolean).join("\n\n") || (media ? "(sem legenda — veja o anexo)" : "");
     const scopedMessage = `[contexto: diretório de trabalho atual é ${cwd} — fique restrito a esse diretório e seus subdiretórios, a menos que eu peça algo fora dele explicitamente]\n\n${body}${attachment}`;
 
-    const { sessionId, text } = await runOpencode({
+    const { sessionId, text } = await runClaude({
       message: scopedMessage,
       sessionId: entry.sessionId,
+      sessionCwd: entry.sessionCwd,
       cwd,
     });
 
-    state[ALLOWED_NUMBER] = { ...entry, sessionId, updatedAt: new Date().toISOString() };
+    const sessionCwd = entry.sessionId && entry.sessionCwd ? entry.sessionCwd : cwd;
+    state[ALLOWED_NUMBER] = { ...entry, sessionId, sessionCwd, updatedAt: new Date().toISOString() };
     saveState(state);
 
     await sendWhatsApp(chatTarget, markdownToWhatsApp(text));
     log("replied, session=", sessionId);
   } catch (err) {
-    log("ERROR running opencode:", err.message);
-    // Killing the client on timeout does NOT stop the run on the warm server:
-    // the session stays busy there, so every later message reusing that same
-    // session id queues behind it and times out too. Drop the session so the
-    // next message starts a fresh one instead of snowballing.
-    if (err.timedOut && entry.sessionId) {
-      state[ALLOWED_NUMBER] = { cwd, updatedAt: new Date().toISOString() };
-      saveState(state);
-      log("dropped stuck session", entry.sessionId);
-    }
+    log("ERROR running claude:", err.message);
     await sendWhatsApp(
       chatTarget,
       markdownToWhatsApp(`\u26A0\uFE0F Erro processando sua mensagem: ${err.message}`),
@@ -740,7 +548,6 @@ const server = http.createServer((req, res) => {
   let body = "";
   req.on("data", (chunk) => (body += chunk));
   req.on("end", () => {
-    // Always ack fast; the bridge fire-and-forgets this POST.
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
 
@@ -759,7 +566,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(ORCH_PORT, "127.0.0.1", () => {
-  log(`WhatsApp<->OpenCode orchestrator listening on 127.0.0.1:${ORCH_PORT}`);
+  log(`WhatsApp<->Claude Code orchestrator listening on 127.0.0.1:${ORCH_PORT}`);
   log(`Allowed number: ${ALLOWED_NUMBER}`);
-  log(`OpenCode cwd: ${OPENCODE_CWD}`);
+  log(`Claude cwd: ${CLAUDE_CWD} (permission mode: ${CLAUDE_PERMISSION_MODE})`);
 });
